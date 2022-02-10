@@ -1,0 +1,140 @@
+---
+title: "Preparation of TCGA GBM Data for Califano Master Regulator Analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+```{r prep_data, warning=FALSE, message=FALSE}
+library(tidyverse)
+
+library(GbmPhenotypeStability)
+
+# set parameters ----------------------------------------------
+dataset_name <- 'GBM (TCGA)'
+exp_tbl <- GbmPhenotypeStability::tcga_pancan_gbm$exp
+# -------------------------------------------------------------
+
+pca <- function(X, center = TRUE, scale = TRUE){
+  prcompOut <- prcomp(x = X, center = center, scale = scale)
+
+  pcaResults <- list()
+  pcaResults$dat   <- prcompOut$x
+  pcaResults$evecs <- prcompOut$rotation
+
+  pcaResults$sdev <- prcompOut$sdev
+  pcVar <- pcaResults$sdev^2
+  pcaResults$pctVar    <- pcVar/sum(pcVar)
+  pcaResults$cumPctVar <- cumsum(pcaResults$pctVar)
+
+  return(pcaResults)
+}
+
+```
+
+
+### GBM Expression-Based Subtype Classification (Proneural, Classical, Mesenchymal)
+
+```{r subtype_classification}
+gbm_subtype_tbl <- readr::read_tsv(
+  '../inst/extdata/tcga_gbm_classification/NIHMS885291-supplement-3.txt',
+  col_types = cols())
+
+identical(
+  stringr::str_sub(gbm_subtype_tbl$Sample_Id_RNAseq, 1, nchar(gbm_subtype_tbl$Sample_Id_U133A)),
+  gbm_subtype_tbl$Sample_Id_U133A
+) %>% stopifnot()
+
+abbr2subtype = c(CL = 'Classical', MS = 'Mesenchymal', PN = 'Proneural')
+
+gbm_subtype_tbl <- gbm_subtype_tbl %>%
+  mutate(
+    sample = stringr::str_replace_all(Sample_Id_U133A, pattern = '\\.', replacement = '-'),
+    Subtype = abbr2subtype[Subtype]
+  ) %>%
+  dplyr::select(sample, everything())
+
+```
+
+### Restrict Data To Samples with GBM Subtype Annotations
+```{r restrict_to_subtype_samples}
+shared_samples <- intersect(colnames(exp_tbl), gbm_subtype_tbl$sample) %>% 
+  sort()
+
+tcga_gbm <- list()
+tcga_gbm$exp <- exp_tbl %>% select(c("gene", all_of(shared_samples)))
+tcga_gbm$annot <- gbm_subtype_tbl %>%
+  select(sample, Subtype) %>%
+  rename(subtype = Subtype) %>%
+  filter(sample %in% shared_samples) %>%
+  arrange(sample)
+
+stopifnot(identical(
+  setdiff(colnames(tcga_gbm$exp), "gene"),
+  tcga_gbm$annot$sample
+))
+stopifnot(
+  !any(duplicated(tcga_gbm$exp$gene)),
+  !any(duplicated(tcga_gbm$annot$sample))
+)
+
+```
+
+
+### PCA 
+```{r gbm_pca}
+gbm_xmat <- tcga_gbm$exp %>%
+  column_to_rownames(var = "gene") %>%
+  as.data.frame() %>%
+  as.matrix()
+stopifnot(is.numeric(gbm_xmat))
+  
+X <- gbm_xmat[!near(apply(gbm_xmat, MARGIN = 1, sd), 0), , drop=FALSE]
+
+set.seed(1)
+gbm_pcout <- pca(t(X))
+pcdata <- left_join(tcga_gbm$annot, tibble(
+    sample = rownames(gbm_pcout$dat),
+    PC1 = gbm_pcout$dat[, 'PC1'],
+    PC2 = gbm_pcout$dat[, 'PC2'],
+    PC3 = gbm_pcout$dat[, 'PC3']
+  ), 
+  by = 'sample'
+)
+
+ggplot(pcdata, aes(x = PC1, y = PC2, color = subtype)) +
+  geom_point() +
+  xlab(paste0('PC1 (', round(gbm_pcout$pctVar[1]*100, 1), '% Variance)')) +
+  ylab(paste0('PC2 (', round(gbm_pcout$pctVar[2]*100, 1), '% Variance)')) +
+  labs(title = 'PCA Projection of TCGA GBM Expression Data')
+
+
+```
+
+
+```{r save_data}
+saveRDS(tcga_gbm, file = "tcga_gbm.rds")
+```
+
+
+```{r}
+tcga_gbm <- readRDS("./tcga_gbm.rds")
+
+#readr::write_tsv(tcga_gbm$exp,file = "tcga_gbm_exp.txt")
+
+X <- tcga_gbm$exp %>%
+  column_to_rownames(var = "gene") %>%
+  as.data.frame() %>%
+  as.matrix()
+
+gene_sd <- apply(X, 1, sd) %>% sort(decreasing = TRUE)
+
+gbmtfs <- ("CEBP")
+
+
+
+```
+
