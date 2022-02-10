@@ -1,0 +1,186 @@
+---
+title: "Califano Master Regulator Discovery Analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+### REQUIREMENTS
++ JAVA RUNTIME ENVIRONMENT
+
+### BACKGROUND
++ [The recurrent architecture of tumour initiation, progression and drug sensitivity](https://www.nature.com/articles/nrc.2016.124)
++ [ARACNE-AP](https://github.com/califano-lab/ARACNe-AP)
+
+
+### SPECIFY INPUT DATA AND PARAMETERS
+```{r setup}
+# NOTE: FOR ACCURATE ESTIMATION OF THE PAIRWISE (GENE-GENE)
+#       MUTUAL INFORMATION MEASURE USED FOR CONTEXT-SPECIFIC 
+#       NETWORK RECONSTRUCTION, THE EXPRESSION MATRIX SHOULD HAVE
+#       **100 OR MORE** SAMPLES (SPANNING A BROAD RANGE OF CELLULAR STATES
+#       AND EXPRESSION LEVELS WITHIN A RELATED TUMOR/TISSUE CONTEXT).
+#       
+# ******************************************************************************
+# GENE EXPRESSION DATA FILE
+# Expected format: tab_separated data table (genes x samples)
+# --- column 1 (column name = gene) lists genes
+# --- other columns: named by sample identifier
+exp_data_file <- "data-raw/tcga_gbm_exp.txt"
+
+# TRANSCRIPTION FACTOR LIST FILE
+# Expected format: Text file - one gene symbol per line, no column name/header.
+# --- Check: entries in this file are named in column 1 of above exp data table.
+# --- Check: https://www.genecards.org/ for alternative gene names (as needed).
+tflist_file <- "data-raw/tcga_gbm_mesenchymal_transfacs.txt"
+
+output_dir <- "TCGA_GBM_ARACNE"
+
+# p-value for mutual information to be significant
+# lower values reduce number of associations in in network.
+aracne_mutinf_pval_threshold <- 1E-8
+
+# Final network is consensus over networks constructed from bootstrapped
+# sample expression subsets.
+n_aracne_bootstraps <- 100
+# ******************************************************************************
+
+library(tidyverse)
+
+```
+
+### (0) Prepare Expression Data
+```{r prep_expression_data}
+transfacs <- readr::read_tsv(tflist_file, show_col_types = FALSE, 
+                             col_names = FALSE)$X1
+exp_tbl <- readr::read_tsv(exp_data_file, show_col_types = FALSE)
+
+# PREPROCESSING: remove genes w/expression value of zero in all samples --------
+exp_data_file <- paste0(
+  tools::file_path_sans_ext(exp_data_file),
+  ".reduced.",
+  tools::file_ext(exp_data_file)
+)
+
+exp_mat <- exp_tbl %>%
+  as.data.frame() %>%
+  column_to_rownames(var = "gene") %>%
+  as.matrix()
+stopifnot(is.numeric(exp_mat))
+
+all_zero_exp <- apply(exp_mat, MARGIN = 1, FUN = function(x) {
+  all(dplyr::near(x, 0))
+})
+exp_mat <- exp_mat[!all_zero_exp, , drop = FALSE]
+
+exp_tbl <- exp_mat %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene") %>%
+  as_tibble()
+
+rm(exp_mat)
+
+readr::write_tsv(exp_tbl, file = exp_data_file)
+
+if (!all(transfacs %in% exp_tbl$gene)) {
+  warning(
+    "No available expression data for these TFs (check alternative names): ",
+    paste0(setdiff(transfacs, exp_tbl$gene), collapse = " ")
+  )
+}
+
+```
+
+
+### (1) Estimate Mutual Information Threshold for ARACNE Network Reconstruction
+```{r calculate_aracne_threshold}
+# Sample command line:
+# java -Xmx5G -jar ./ARACNe-AP/dist/aracne.jar \
+#   -e ./data-raw/tcga_gbm_exp.reduced.txt  \
+#   -o TCGA_GBM_ARACNE \
+#   --tfs ./data-raw/tcga_gbm_mesenchymal_transfacs.txt \
+#   --pvalue 1E-8 \
+#   --seed 1 \
+#   --calculateThreshold
+
+system2(
+  command = "java",
+  args    = c(
+    "-Xmx5G", "-jar", "./ARACNe-AP/dist/aracne.jar",
+    "-e", exp_data_file,
+    "-o", output_dir,
+    "--tfs", tflist_file,
+    "--pvalue", as.character(aracne_mutinf_pval_threshold),
+    "--seed", "1",
+    "--calculateThreshold"
+  )
+)
+```
+
+
+### (2) Bootstrapping/Network Reconstruction
+```{r bootstrap_network_reconstruction}
+# Sample command line (per iterate):
+# java -Xmx5G -jar ./ARACNe-AP/dist/aracne.jar   \
+#   -e ./data-raw/tcga_gbm_exp.reduced.txt    \
+#   -o TCGA_GBM_ARACNE   \
+#   --tfs ./data-raw/tcga_gbm_mesenchymal_transfacs.txt \
+#   --pvalue 1E-8 \
+#   --seed 1
+
+for (i in seq_len(n_aracne_bootstraps)) {
+  print(paste0("--------------- bootstrap iterate: ", i, "  ----------------"))
+  
+  system2(
+    command = "java",
+    args    = c(
+      "-Xmx5G", "-jar", "./ARACNe-AP/dist/aracne.jar",
+      "-e", exp_data_file,
+      "-o", output_dir,
+      "--tfs", tflist_file,
+      "--pvalue", as.character(aracne_mutinf_pval_threshold),
+      "--seed", as.character(i)
+    )
+  )
+}
+
+```
+
+
+### (3) Build Consensus Regulatory Network
+```{r}
+#java -Xmx5G -jar ./ARACNe-AP/dist/aracne.jar \
+#   -o TCGA_GBM_ARACNE \
+#   --consolidate
+
+system2(
+    command = "java",
+    args    = c(
+      "-Xmx5G", "-jar", "./ARACNe-AP/dist/aracne.jar",
+      "-o", output_dir,
+      "--consolidate"
+    )
+  )
+```
+
+
+### Review Consensus Network Attributes
+```{r review_network_attributes}
+aracne_network_file <- file.path(output_dir, "network.txt")
+
+aracne_network_tbl <- readr::read_tsv(aracne_network_file, 
+                                      show_col_types = FALSE)
+
+# Here we're supposing that the TFs in the transcription factor list file
+# constitute a phenotypic regulatory checkpoint module and we're looking their
+# interconnectivity.
+checkpt_tbl <- aracne_network_tbl %>% filter((Target %in% transfacs)) %>%
+  arrange(Regulator, pvalue)
+
+quantile(aracne_network_tbl$MI, probs = c(0, 0.5, 0.75, 0.85, 0.90, 0.95, 1))
+
+```
+
